@@ -96,103 +96,160 @@ Google Contacts and Notion are just today's answer for the first two boxes.
                                               └──────────────────────────┘
 ```
 
-Three separate jobs, three separate concerns:
+## The jobs
+
+Almost everything runs on GitHub Actions. Only the portal and one LinkedIn
+script run somewhere else.
+
+**The daily core, in this order:**
 
 1. **`sync.py`** keeps Google Contacts and Notion's contact facts in
-   agreement. No AI, standard library only. Runs on GitHub Actions.
-2. **`decision_flow.py`** is the only place an LLM runs. It's a plain batch
-   job (fixed sequence: gate check, then one Claude call per qualifying
-   contact) — not an agent, no tool-calling loop. It never writes contact
-   facts; it only writes to the Ledger. Also runs on GitHub Actions, right
-   after sync.
+   agreement. No AI, standard library only.
+2. **`decision_flow.py`** is the daily AI batch. It is a plain job (fixed
+   sequence: gate check, then one Claude call per qualifying contact), not
+   an agent, with no tool-calling loop. It never writes Google-owned
+   contact facts. It writes review cards to the Ledger. For a few low-risk
+   fields (Communities, City, Region, Cadence Tier, AI Snapshot) it writes
+   the field and also logs a card you can revert. It runs right after sync.
 3. **`portal/`** is a small always-on web dashboard for acting on what the
-   other two produced (`main.py`, `cards.py`, and friends — a FastAPI app
-   with server-rendered templates). It reads and writes Notion directly
-   over the plain REST API and never calls an LLM in its own request path
-   (there's an optional, separately-gated chat feature that does call an
-   LLM, off by default).
+   other two produced (a FastAPI app with server-rendered templates). It
+   reads and writes Notion directly over the plain REST API. Its main
+   pages never call an LLM. There is an optional chat feature that does,
+   and it is off by default.
+
+**Side jobs:**
+
+| Job | Runs | What it does |
+|---|---|---|
+| `digest.py` | Weekly, inside the sync workflow | Finds overdue contacts and posts a digest as a GitHub Issue |
+| `close_stale_notices.py` | Daily | Closes notice Issues that are 14+ days old |
+| `linkedin_sweep.py` | Daily | Reads LinkedIn connection-accepted emails in Gmail and flags new connections in Diagnostics |
+| `diagnostics_check.py` | On demand | Writes data-hygiene problems (missing name, duplicates, stuck tier) to the Diagnostics database |
+| `execute_duplicate_merges.py` | On demand | Merges only the duplicate groups a human confirmed in the portal |
+| `onboarding/`, `troubleshooting/` | Once, on demand | Setup and cleanup passes: import contacts, clear backlogs, repair old incidents. Never scheduled |
+
+### Every couple of months: the LinkedIn catch-up
+
+`linkedin_reconcile.py` is the one job that is deliberately manual. It
+works from LinkedIn's own data export, so you request a fresh export, unzip
+it, and run the script on your own machine.
+
+It compares the export with the CRM and reports:
+
+- **Job changes.** Company and title differences for people it can match.
+- **Name differences.** Where the spellings differ, the fuller name wins.
+- **New people.** Anyone you messaged in the last 12 months who is not in
+  the CRM yet.
+
+Matching tries the LinkedIn profile link first, then an exact name. It
+never merges on a near match. Near matches are listed for a human to decide.
+Two different people can share a name, so a link that already matched one
+profile blocks a second profile with the same name.
+
+By default it only writes a report. Flags apply each part:
+`--apply-company`, `--apply-titles`, `--apply-names`, `--apply-new`. Applied
+edits are written as `Pending Push`, so the next sync carries them to
+Google. A new person is created in Notion and Google, and gets one
+`Approve` card holding a Journal note that Claude drafted (told to leave out
+sensitive details). The export stays on your machine. Only the message text
+needed for a draft goes to the model. The script keeps no history of old
+values.
+
+## How the sync stays safe
+
+Every contact row has a `Sync Status`. It is how you tell the sync what to
+do with a row.
+
+| Value | Meaning |
+|---|---|
+| `Synced` | Normal. Google wins any disagreement. |
+| `Pending Push` | Your Notion edit overwrites Google once, then the row goes back to `Synced`. |
+| `Pending Pull` | Refresh this row from Google. |
+| `Pending Delete` | Delete it everywhere. |
+| `Review` | Frozen. The sync ignores the row. |
+
+These rules cause most of the sync bugs when they are broken:
+
+- **Google wins by default.** Notion edits to Google-owned fields revert on
+  the next pull unless the row is `Pending Push`.
+- **One identity key links a row to a Google contact**
+  (`sys_Google Resource Name`). Clear it and the next sync creates a
+  duplicate.
+- **Deleting a Notion row by hand does not work.** The pull sees a Google
+  contact with no row and recreates it. The only delete is `Pending Delete`.
+- **Runs queue and do not overlap.**
+
+## Report mode before apply mode
+
+Every flow that writes has a switch with three values: `off`, `report`,
+`apply`.
+
+- **`report`** runs everything, including the model calls, and prints what
+  it would write. It writes nothing to Notion.
+- **`apply`** writes for real.
+
+A new flow starts in `report`. You read its output against real data, and
+only then switch it to `apply`. Some flows stay in `report` on purpose. A
+wrong write by an AI layer costs more than a missed suggestion.
 
 ## Notion schema
 
 Three databases, one Notion integration token shared across all of them.
-Each has exactly one system that's allowed to write to any given field —
-that split is the load-bearing design decision in this project (more on
-that below).
+Each field has exactly one system allowed to write it. That split is the
+load-bearing design decision in this project (more on that below). The
+tables below show the columns that carry the design. Each database also
+has helper columns, many prefixed `sys_`. Read the live schema in Notion for
+the full list.
 
-### Master CRM — one row per person
+### Master CRM: one row per person
 
-Google-authoritative (sync.py overwrites Notion with Google's value every
-pull; changing these in Notion doesn't stick unless you flag the row):
-
-| Property | Type | Notes |
+| Property | Owner | Notes |
 |---|---|---|
-| Name | Title | |
-| Email, All Emails | Email, Text | `Email` is the primary; `All Emails` holds the rest |
-| Phone, All Phones | Phone, Text | same pattern as email |
-| Company | Text | Google's `organizations[0].name` |
-| Title | Text | Google's `organizations[0].title` |
-| Address | Text | Google's formatted address |
-| Birthday | Date | |
-| Labels | Multi-select | Google contact-group memberships |
-| Google Extras | Text | Google's free-form `userDefined` key/value pairs |
-| `sys_Google Resource Name` | Text | The identity key — see "Design decisions" |
-| Sync Status | Select: `Synced` / `Pending Push` / `Pending Delete` | How a row asks to be pushed or deleted, see below |
-| `sys_Last Synced` | Date | |
+| Name, Email, All Emails, Phone, All Phones, Company, Title, Address, Birthday, Labels | Google | The sync overwrites Notion with Google's value on every pull. `All Emails` and `All Phones` hold the extras. |
+| `sys_Google Resource Name` | Sync | The identity key. See "How the sync stays safe". |
+| Sync Status | You and the sync | How a row asks to be pushed, pulled, deleted, or frozen. |
+| LinkedIn URL, LinkedIn Profiles | Notion | The primary profile link, and every link found for the person. |
+| Journal | Notion | Free-form relationship notes. The sync never writes it. |
+| Cadence Tier | Notion | How often the person should come up: `Tier 1 (30 Days)`, `Tier 2 (90 Days)`, `Semi-Annual (180 Days)`, `Tier 3 (365 Days)`, `Tier 4 (As-Needed)`, `Organic - No Reminder`, or `Rolodex Only`. |
+| Last Contacted, Communities, City, Region | Notion | Relationship fields. City and Region come from Google's address when it has one, or from `decision_flow.py` when it does not. |
+| `sys_Cadence Days (Auto)`, Next Follow-up | Derived | The number of days behind the tier, and the date the next check-in is due. Never set by hand. |
+| AI Snapshot | `decision_flow.py` | An optional cached summary, refreshed when the Journal changes. |
+| Ledger, Diagnostics | Relations | Link a person to their cards and data-hygiene rows. |
 
-Notion-authoritative (sync.py never writes these — this is where the actual
-relationship-management happens):
+### Ledger: one row per AI-generated suggestion
 
-| Property | Type | Notes |
-|---|---|---|
-| Journal | Text | Freeform relationship notes/log |
-| Cadence Tier | Select: `Tier 1 (30 Days)` / `Tier 2 (90 Days)` / `Semi-Annual (180 Days)` / `Tier 3 (365 Days)` / `Tier 4 (As-Needed)` / `Organic - No Reminder` / `Rolodex Only` | How often this person should come up for a check-in |
-| Last Contacted | Date | |
-| Communities | Multi-select | Freeform relationship tags (e.g. shared context, groups) |
-| City, Region | Text | Filled either deterministically from Google's address or, failing that, inferred by `decision_flow.py` |
+Written by `decision_flow.py` and a few other flows. Read and resolved by
+the portal.
 
-System-computed, derived rather than hand-set:
+| Property | Notes |
+|---|---|
+| Entry | Title |
+| Contact | Relation to Master CRM. A combined card can hold several contacts. |
+| Card Type | `Approve`, `Acknowledge`, or `Answer`. See "Card types". |
+| Status | Where the card is: open, done, snoozed, dismissed, answered, and so on. |
+| Field Affected, Source | Which contact field the card is about, and which flow produced it. |
+| Suggested Text | The model's draft, or your own text for a manual reminder. |
+| Old Value | The prior field value, so a write can be reverted. |
+| User Response | What you said or did, logged for context. |
+| Snooze Until, Resolved | Dates for resurfacing and closing. |
 
-| Property | Type | Notes |
-|---|---|---|
-| `sys_Cadence Days (Auto)` | Number | Numeric twin of Cadence Tier (30/90/180/365, or empty for the two no-reminder tiers) |
-| Next Follow-up | Date (formula) | Built from Last Contacted + `sys_Cadence Days (Auto)` |
-| `sys_Duplicate Group` | Text | Set by the duplicate-detection pass |
-| AI Snapshot, `sys_Snapshot Updated` | Text, Date | An optional cached summary, refreshed periodically |
+### Diagnostics: one row per data-hygiene issue
 
-### Ledger — one row per AI-generated suggestion
+This is a separate concern from the Ledger. It asks whether a contact's data
+is well-formed (missing name, likely duplicate) rather than what to do about
+the relationship. It has its own lifecycle. A row goes from flagged, to fix
+requested, to fixed (or fix failed, or dismissed). It does not share the
+Ledger's statuses.
 
-Written by `decision_flow.py`, read and resolved by the portal.
-
-| Property | Type | Notes |
-|---|---|---|
-| Entry | Title | |
-| Contact | Relation → Master CRM | Can hold more than one contact for a combined card |
-| Card Type | Select: `Approve` / `Acknowledge` / `Answer` | See "Card types" below |
-| Status | Select: `Open` / `Done` / `Will do` / `Not now` / `Dismissed` / `Answered` / `Declined` / `Looks Good` / `Reverted` | |
-| Field Affected | Select | Which Master CRM field this card is about, if any (`Journal`, `Cadence`, `Community`, `Geography`, ...) |
-| Source | Select | Which processor generated it (`Journal`, `Milestone`, `Cross-Mention`, `Manual`, ...) — `Manual` also covers user-set ad-hoc reminders |
-| Suggested Text | Text | The model's draft, or the user's own text for a manual reminder |
-| Old Value | Text | The prior field value, so a write can be reverted |
-| User Response | Text | What the user actually said/did, logged back for context |
-| Snooze Until | Date | When a snoozed or manually-scheduled card resurfaces |
-| Resolved | Date | |
-
-### Diagnostics — one row per data-hygiene issue
-
-A separate concern from the Ledger: "is this contact's data well-formed"
-(malformed email, likely duplicate) rather than relationship intelligence.
-Written by `diagnostics_check.py` and related scripts, read by the portal.
-
-| Property | Type | Notes |
-|---|---|---|
-| Entry | Title | |
-| Contact | Relation → Master CRM | |
-| Issue Type | Select | e.g. malformed email, likely duplicate |
-| Detail | Text | |
-| Fix Type | Select | What kind of fix this issue takes; the portal's batch actions fork on this |
-| Status | Select | Same open/resolved shape as the Ledger |
-| Ledger Card | Relation → Ledger | When a diagnostics fix also needs an approvable write |
-| Detected | Date | |
+| Property | Notes |
+|---|---|
+| Entry, Contact, Detail | What is wrong and for whom |
+| Issue Type | For example missing name, duplicate, possible identity match |
+| Source | Which check found it |
+| Fix Type | `Deterministic`, `Judgment`, or `Manual`. The portal's batch actions fork on this. |
+| Status | The lifecycle above |
+| Ledger Card | Link to a card, when a fix also needs an approvable write |
+| Detected, Resolved | Dates |
 
 ## Card types (the Ledger's core idea)
 
@@ -213,19 +270,25 @@ Nothing the AI layer does is a one-way door.
 Each is gated independently (mostly: is this contact "due," per Cadence
 Tier) and claims a contact for at most one open card per run:
 
-- **Suggested Interactions** — cadence-due, has Journal history → Approve card with a drafted next step.
-- **Questions** — cadence-due, empty Journal → Answer card asking why you care about this person.
-- **Communities** / **Geography** — infers tags/location from Journal + labels → Acknowledge card.
-- **Cadence Tier** — catches the minority of "no reminder" contacts where the evidence suggests they should actually have one → Acknowledge card.
-- **Milestones** — a recent Journal entry looks like a real milestone (new job, promotion, etc.) → Approve card, independent of cadence.
-- **Cross-Mention** — someone else's Journal entry mentions this contact → Approve card, attachable to multiple people at once.
-- **External Signals** (optional) — folds in calendar/email/briefing-doc context as an opt-in, read-only extra source, feeding the same processors above rather than being its own card type.
+- **Suggested Interactions**: cadence-due, has Journal history. An Approve card with a drafted next step.
+- **Questions**: cadence-due, empty Journal. An Answer card asking why you care about this person.
+- **Communities** and **Geography**: infer tags and location from Journal and labels. An Acknowledge card.
+- **Cadence Tier**: catches the "no reminder" contacts where the evidence suggests they should have one. An Acknowledge card.
+- **Milestones**: a recent Journal entry looks like a real milestone (new job, promotion). An Approve card, independent of cadence.
+- **Cross-Mention**: someone else's Journal entry mentions this contact. An Approve card that can attach to several people at once.
+- **External Signals** (optional): folds in calendar, email, and briefing-doc context as a read-only extra source. It feeds the processors above instead of being its own card type.
+- **Email Reply**: when you reply to an email from a known contact, sets Last Contacted to the reply date and logs a revertable Acknowledge card. It also drafts a short Journal note as an Approve card.
+
+Two jobs in the same file sit outside the card system. **Snapshot**
+regenerates the AI Snapshot when a contact's Journal changes. **Resurface**
+reopens snoozed cards when their date arrives. Resurface is date bookkeeping
+only and uses no model.
 
 ## Design decisions worth knowing before you fork this
 
 - **Split authority, not shared authority.** Every field has exactly one
-  system allowed to write it (see the Google-authoritative /
-  Notion-authoritative split above). Fights over whose edit wins are solved
+  system allowed to write it (see the Owner column in the
+  schema tables above). Fights over whose edit wins are solved
   at the schema level, not at merge time.
 - **One identity key ties a Notion row to a Google contact**
   (`sys_Google Resource Name`). Losing or clearing it un-links the row —
@@ -240,10 +303,18 @@ Tier) and claims a contact for at most one open card per run:
   per candidate, budget-capped per run. Cheaper to build and run, and much
   easier to reason about when something misfires than an open-ended agent
   loop would be.
-- **The portal has no AI in its main code path.** It only resolves what the
-  batch job already produced, so the always-on web app stays simple and
-  cheap to run; the metered/costed part runs once a day, on GitHub's
+- **A human approves the AI's work.** The model drafts and the person
+  decides (Approve), or the model writes a low-risk field and tells the
+  person, who can revert it (Acknowledge). Every card keeps the old value.
+  Nothing the AI does is a one-way door.
+- **The daily sync and the portal's main pages use no AI.** The model runs
+  in a few clearly separated places: the daily batch (`decision_flow.py`),
+  the optional portal chat, and a few one-time or manual scripts (the
+  onboarding passes and the LinkedIn catch-up). The always-on web app stays
+  simple and cheap. The costed part runs once a day on GitHub's
   infrastructure, not on every page load.
+- **Report before apply.** New flows run in `report` mode first. See
+  "Report mode before apply mode".
 
 ## Stack
 
@@ -256,7 +327,8 @@ Tier) and claims a contact for at most one open card per run:
 - GitHub Actions for scheduling (sync and decision-flow run daily, one
   after the other).
 - Claude, one call per candidate in `decision_flow.py`, cost-capped per run
-  and logged with real token/dollar totals.
+  and logged with real token/dollar totals. The optional portal chat and a
+  few one-time scripts call it too.
 
 ## Configuration
 
